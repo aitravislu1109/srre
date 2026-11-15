@@ -1,0 +1,637 @@
+# =============================================================================
+# Flash Sale Mall 巡檢清單 v1
+# 給「固定收集」程式（①）讀取；判定（②）依 eval 規則產生 綠 / 黃 / 紅
+# =============================================================================
+#
+# 欄位說明
+#   id         唯一識別，格式 <層級>.<項目>
+#   name       報告上顯示的名稱
+#   layer      分層：可用性 / API / 應用 / MySQL / Redis / Kafka / 日誌 / Trace / 業務 / 資源 / 監控自身
+#   source     prometheus | loki | mysql
+#   query      查詢語句（PromQL / LogQL / SQL）
+#   unit       顯示單位：ratio | count | seconds | bytes | qps
+#   eval       判定規則（見下方四種 type）
+#   drilldown  紅燈時下鑽要派的子 Agent（順序即優先）
+#   ready      true = 現在就能跑；false = 需先完成 requires 列的前置條件
+#   requires   前置條件代號（見檔尾 prerequisites）
+#   note       補充說明 / 為什麼這項重要
+#
+# eval.type
+#   threshold  數值與門檻比較：op(> 或 <), warn, crit
+#   any        查詢有回傳任何一列 / 數值 > 0 即觸發 level
+#   trend      與過去比較：compare(1d|7d), warn_pct, crit_pct（變化百分比，正負皆算）
+#   set_diff   本次結果集合 vs 過去 compare 期間的集合，出現新成員即觸發 level
+#
+# 共用預設
+defaults:
+  window: 1h            # 「目前狀態」類查詢的時間窗
+  report_window: 24h    # 日報彙總的時間窗
+  backend_job: flashsale-api
+  loki_backend_selector: '{service="backend"}'   # promtail 以 compose service 名稱當 label
+
+items:
+
+  # ---------------------------------------------------------------------------
+  # 可用性
+  # ---------------------------------------------------------------------------
+  - id: avail.targets_down
+    name: 抓取目標存活
+    layer: 可用性
+    source: prometheus
+    query: 'up == 0'
+    unit: count
+    eval: {type: any, level: crit}
+    drilldown: [prometheus-agent, log-agent]
+    ready: true
+    note: 任何一個 target（backend / mysql-exporter / redis-exporter）掛掉
+
+  - id: avail.http_5xx_ratio
+    name: 後端 5xx 比例（近 1 小時）
+    layer: 可用性
+    source: prometheus
+    query: |
+      sum(rate(http_requests_total{job="flashsale-api",status=~"5.."}[1h]))
+      /
+      sum(rate(http_requests_total{job="flashsale-api"}[1h]))
+    unit: ratio
+    eval: {type: threshold, op: ">", warn: 0.01, crit: 0.05}
+    drilldown: [log-agent, prometheus-agent, mysql-agent]
+    ready: true
+
+  - id: avail.process_restarts
+    name: 後端重啟次數（24h）
+    layer: 可用性
+    source: prometheus
+    query: 'changes(process_start_time_seconds{job="flashsale-api"}[24h])'
+    unit: count
+    eval: {type: threshold, op: ">", warn: 0, crit: 2}
+    drilldown: [log-agent]
+    ready: true
+    note: 非預期重啟常見原因是 OOM 或 healthcheck 失敗
+
+  # ---------------------------------------------------------------------------
+  # API（RED）
+  # ---------------------------------------------------------------------------
+  - id: api.qps
+    name: 整體 QPS
+    layer: API
+    source: prometheus
+    query: 'sum(rate(http_requests_total{job="flashsale-api"}[1h]))'
+    unit: qps
+    eval: {type: trend, compare: 1d, warn_pct: 50, crit_pct: 80}
+    drilldown: [prometheus-agent]
+    ready: true
+    note: 與昨天同時段比較；秒殺活動日本來就會暴增，報告需對照活動排程解讀
+
+  - id: api.seckill_error_ratio
+    name: 秒殺下單失敗比例（排除 429）
+    layer: API
+    source: prometheus
+    query: |
+      sum(rate(http_requests_total{job="flashsale-api",route="/api/seckill",status!~"2..|429"}[1h]))
+      /
+      sum(rate(http_requests_total{job="flashsale-api",route="/api/seckill"}[1h]))
+    unit: ratio
+    eval: {type: threshold, op: ">", warn: 0.02, crit: 0.10}
+    drilldown: [log-agent, mysql-agent, prometheus-agent]
+    ready: true
+    note: 最核心的業務 API；「售罄」回應若非 2xx 需在此排除
+
+  - id: api.rate_limited_ratio
+    name: 限流（429）比例
+    layer: API
+    source: prometheus
+    query: |
+      sum(rate(http_requests_total{job="flashsale-api",status="429"}[1h]))
+      /
+      sum(rate(http_requests_total{job="flashsale-api"}[1h]))
+    unit: ratio
+    eval: {type: threshold, op: ">", warn: 0.20, crit: 0.50}
+    drilldown: [prometheus-agent]
+    ready: true
+    note: 限流是預期行為，但比例過高代表門檻過嚴或遭到刷單
+
+  - id: api.latency_p95
+    name: API P95 延遲
+    layer: API
+    source: prometheus
+    query: |
+      histogram_quantile(0.95,
+        sum by (le) (rate(http_server_requests_seconds_bucket{job="flashsale-api"}[1h])))
+    unit: seconds
+    eval: {type: threshold, op: ">", warn: 0.5, crit: 2}
+    drilldown: [prometheus-agent, mysql-agent]
+    ready: false
+    requires: [P2]
+
+  - id: api.route_label_cardinality
+    name: route 標籤基數
+    layer: API
+    source: prometheus
+    query: 'count(count by (route) (http_requests_total{job="flashsale-api"}))'
+    unit: count
+    eval: {type: threshold, op: ">", warn: 200, crit: 1000}
+    drilldown: []
+    ready: true
+    note: MetricsFilter 用 getRequestURI() 當 route，/api/orders/123 這類路徑會讓時序數爆增，拖垮 Prometheus
+
+  # ---------------------------------------------------------------------------
+  # 應用（JVM / 連線池）
+  # ---------------------------------------------------------------------------
+  - id: app.heap_usage
+    name: JVM heap 使用率
+    layer: 應用
+    source: prometheus
+    query: |
+      sum(jvm_memory_used_bytes{job="flashsale-api",area="heap"})
+      /
+      sum(jvm_memory_max_bytes{job="flashsale-api",area="heap"} > 0)
+    unit: ratio
+    eval: {type: threshold, op: ">", warn: 0.75, crit: 0.90}
+    drilldown: [prometheus-agent, log-agent]
+    ready: true
+
+  - id: app.gc_time_ratio
+    name: GC 佔用時間比例
+    layer: 應用
+    source: prometheus
+    query: 'sum(rate(jvm_gc_pause_seconds_sum{job="flashsale-api"}[1h]))'
+    unit: ratio
+    eval: {type: threshold, op: ">", warn: 0.05, crit: 0.10}
+    drilldown: [prometheus-agent]
+    ready: true
+
+  - id: app.hikari_usage
+    name: DB 連線池使用率
+    layer: 應用
+    source: prometheus
+    query: |
+      max(hikaricp_connections_active{job="flashsale-api"}
+          / hikaricp_connections_max{job="flashsale-api"})
+    unit: ratio
+    eval: {type: threshold, op: ">", warn: 0.80, crit: 0.95}
+    drilldown: [mysql-agent, prometheus-agent, log-agent]
+    ready: true
+
+  - id: app.hikari_pending
+    name: 等待取得連線的執行緒
+    layer: 應用
+    source: prometheus
+    query: 'max(hikaricp_connections_pending{job="flashsale-api"})'
+    unit: count
+    eval: {type: threshold, op: ">", warn: 0, crit: 5}
+    drilldown: [mysql-agent, log-agent]
+    ready: true
+    note: 鎖表 / 長交易時第一個亮的通常是這項
+
+  # ---------------------------------------------------------------------------
+  # MySQL
+  # ---------------------------------------------------------------------------
+  - id: mysql.down
+    name: MySQL 存活
+    layer: MySQL
+    source: prometheus
+    query: 'mysql_up == 0'
+    unit: count
+    eval: {type: any, level: crit}
+    drilldown: [log-agent]
+    ready: true
+
+  - id: mysql.connection_usage
+    name: 連線數佔 max_connections
+    layer: MySQL
+    source: prometheus
+    query: 'mysql_global_status_threads_connected / mysql_global_variables_max_connections'
+    unit: ratio
+    eval: {type: threshold, op: ">", warn: 0.70, crit: 0.90}
+    drilldown: [mysql-agent]
+    ready: true
+
+  - id: mysql.slow_queries
+    name: 慢查詢數（24h）
+    layer: MySQL
+    source: prometheus
+    query: 'increase(mysql_global_status_slow_queries[24h])'
+    unit: count
+    eval: {type: trend, compare: 7d, warn_pct: 50, crit_pct: 200}
+    drilldown: [mysql-agent]
+    ready: true
+    note: 預設 long_query_time=10s，建議調低到 1s 這項才有意義
+
+  - id: mysql.table_lock_waits
+    name: 表鎖等待次數（1h）
+    layer: MySQL
+    source: prometheus
+    query: 'increase(mysql_global_status_table_locks_waited[1h])'
+    unit: count
+    eval: {type: threshold, op: ">", warn: 0, crit: 10}
+    drilldown: [mysql-agent, log-agent]
+    ready: true
+    note: 對應 loadtest-service 的 LOCK TABLES 故障注入
+
+  - id: mysql.row_lock_current_waits
+    name: 目前 InnoDB 行鎖等待
+    layer: MySQL
+    source: prometheus
+    query: 'mysql_global_status_innodb_row_lock_current_waits'
+    unit: count
+    eval: {type: threshold, op: ">", warn: 0, crit: 5}
+    drilldown: [mysql-agent]
+    ready: true
+
+  - id: mysql.tables_in_use
+    name: 被鎖住的表
+    layer: MySQL
+    source: mysql
+    query: 'SHOW OPEN TABLES FROM flashsale WHERE In_use > 0'
+    unit: count
+    eval: {type: any, level: crit}
+    drilldown: [mysql-agent]
+    ready: true
+    requires: [P1]
+    note: 直接抓到鎖表；P1 為安全前置（唯讀帳號），不影響查詢本身
+
+  - id: mysql.long_transactions
+    name: 執行超過 60 秒的交易
+    layer: MySQL
+    source: mysql
+    query: |
+      SELECT trx_id, trx_mysql_thread_id, trx_state,
+             TIMESTAMPDIFF(SECOND, trx_started, NOW()) AS age_sec,
+             LEFT(trx_query, 200) AS query
+      FROM information_schema.innodb_trx
+      WHERE trx_started < NOW() - INTERVAL 60 SECOND
+      ORDER BY trx_started
+    unit: count
+    eval: {type: any, level: warn, crit_if: 'age_sec > 300'}
+    drilldown: [mysql-agent]
+    ready: true
+    requires: [P1]
+    note: 唯讀帳號需要 PROCESS 權限才看得到 innodb_trx
+
+  - id: mysql.lock_waiting_sessions
+    name: 正在等鎖的連線
+    layer: MySQL
+    source: mysql
+    query: |
+      SELECT id, user, time, state, LEFT(info, 200) AS query
+      FROM information_schema.processlist
+      WHERE state LIKE 'Waiting for%lock%'
+    unit: count
+    eval: {type: any, level: crit}
+    drilldown: [mysql-agent]
+    ready: true
+    requires: [P1]
+
+  # ---------------------------------------------------------------------------
+  # Redis
+  # ---------------------------------------------------------------------------
+  - id: redis.down
+    name: Redis 存活
+    layer: Redis
+    source: prometheus
+    query: 'redis_up == 0'
+    unit: count
+    eval: {type: any, level: crit}
+    drilldown: [log-agent]
+    ready: true
+
+  - id: redis.memory_usage
+    name: 記憶體佔 maxmemory（256MB）
+    layer: Redis
+    source: prometheus
+    query: 'redis_memory_used_bytes / redis_memory_max_bytes'
+    unit: ratio
+    eval: {type: threshold, op: ">", warn: 0.70, crit: 0.85}
+    drilldown: [prometheus-agent]
+    ready: true
+    note: 策略是 allkeys-lru，接近上限就會開始淘汰 key，包括庫存 key（見 redis.evictions）
+
+  - id: redis.evictions
+    name: 被淘汰的 key 數（24h）
+    layer: Redis
+    source: prometheus
+    query: 'increase(redis_evicted_keys_total[24h])'
+    unit: count
+    eval: {type: threshold, op: ">", warn: 0, crit: 0}
+    drilldown: [log-agent, mysql-agent]
+    ready: true
+    note: >-
+      高風險：seckill:stock:{id} 被淘汰後，下一次下單會用 DB 的 stock（初始值，購買流程不會扣 DB 庫存）
+      重新初始化 → 庫存回到初始值 → 超賣。任何淘汰都直接列紅燈
+
+  - id: redis.hit_ratio
+    name: 快取命中率
+    layer: Redis
+    source: prometheus
+    query: |
+      sum(rate(redis_keyspace_hits_total[1h]))
+      /
+      (sum(rate(redis_keyspace_hits_total[1h])) + sum(rate(redis_keyspace_misses_total[1h])))
+    unit: ratio
+    eval: {type: threshold, op: "<", warn: 0.80, crit: 0.50}
+    drilldown: [prometheus-agent]
+    ready: true
+
+  # ---------------------------------------------------------------------------
+  # Kafka
+  # ---------------------------------------------------------------------------
+  - id: kafka.consumer_lag
+    name: 訂單 consumer lag
+    layer: Kafka
+    source: prometheus
+    query: 'sum(kafka_consumergroup_lag{consumergroup="seckill_consumer_group"})'
+    unit: count
+    eval: {type: threshold, op: ">", warn: 1000, crit: 10000}
+    drilldown: [log-agent, mysql-agent]
+    ready: false
+    requires: [P4]
+    note: lag 高 = 使用者看到下單成功但訂單遲遲沒寫入
+
+  - id: kafka.dlq_growth
+    name: DLQ 新增訊息數（24h）
+    layer: Kafka
+    source: prometheus
+    query: 'sum(increase(kafka_topic_partition_current_offset{topic="order-events-dlq"}[24h]))'
+    unit: count
+    eval: {type: threshold, op: ">", warn: 0, crit: 50}
+    drilldown: [log-agent, mysql-agent]
+    ready: false
+    requires: [P4]
+
+  - id: kafka.dlq_via_logs
+    name: 送進 DLQ 的訂單（日誌替代版）
+    layer: Kafka
+    source: loki
+    query: |
+      sum by (message) (count_over_time(
+        {service="backend"} | json | level="ERROR"
+        | message=~"order_insert_error|kafka_consume_order_error" [24h]))
+    unit: count
+    eval: {type: threshold, op: ">", warn: 0, crit: 50}
+    drilldown: [log-agent, mysql-agent]
+    ready: true
+    note: 在 kafka-exporter 補上之前，用 consumer 的錯誤日誌估算 DLQ 量
+
+  # ---------------------------------------------------------------------------
+  # 日誌
+  # ---------------------------------------------------------------------------
+  - id: log.backend_errors_by_type
+    name: 後端 ERROR 數（依類型，24h）
+    layer: 日誌
+    source: loki
+    query: |
+      sum by (message) (count_over_time(
+        {service="backend"} | json | level="ERROR" [24h]))
+    unit: count
+    eval: {type: trend, compare: 1d, warn_pct: 100, crit_pct: 500}
+    drilldown: [log-agent]
+    ready: true
+    note: 後端日誌是 JSON，message 是固定的事件代碼（如 order_insert_error），可直接分組
+
+  - id: log.new_error_types
+    name: 新出現的錯誤類型
+    layer: 日誌
+    source: loki
+    query: |
+      sum by (message) (count_over_time(
+        {service="backend"} | json | level="ERROR" [24h]))
+    unit: count
+    eval: {type: set_diff, compare: 7d, level: warn}
+    drilldown: [log-agent]
+    ready: true
+    note: 過去 7 天沒出現過的 message 代碼，通常代表新 bug 或新故障
+
+  - id: log.unhandled_exception
+    name: 未處理的例外（24h）
+    layer: 日誌
+    source: loki
+    query: |
+      sum(count_over_time(
+        {service="backend"} | json | message="unhandled_exception" [24h]))
+    unit: count
+    eval: {type: threshold, op: ">", warn: 0, crit: 50}
+    drilldown: [log-agent]
+    ready: true
+
+  - id: log.stock_cache_reinit
+    name: 活動中庫存快取被重建
+    layer: 日誌
+    source: loki
+    query: |
+      sum by (goods_id) (count_over_time(
+        {service="backend"} | json | message="seckill_init_stock_cache" [24h]))
+    unit: count
+    eval: {type: threshold, op: ">", warn: 1, crit: 1}
+    drilldown: [log-agent, mysql-agent]
+    ready: true
+    note: 同一商品在一天內重建超過一次，代表庫存 key 中途消失（淘汰或被刪），是超賣前兆
+
+  - id: log.infra_errors
+    name: 基礎元件錯誤日誌（24h）
+    layer: 日誌
+    source: loki
+    query: |
+      sum by (service) (count_over_time(
+        {service=~"mysql|redis|kafka|zookeeper"} |~ "(?i)(error|fatal)" [24h]))
+    unit: count
+    eval: {type: trend, compare: 1d, warn_pct: 100, crit_pct: 500}
+    drilldown: [log-agent]
+    ready: true
+
+  # ---------------------------------------------------------------------------
+  # Trace（Tempo span-metrics / service-graphs）
+  # ---------------------------------------------------------------------------
+  - id: trace.span_p99_by_service
+    name: 各服務 span P99 延遲
+    layer: Trace
+    source: prometheus
+    query: |
+      histogram_quantile(0.99,
+        sum by (le, service) (rate(traces_spanmetrics_latency_bucket[1h])))
+    unit: seconds
+    eval: {type: threshold, op: ">", warn: 1, crit: 3}
+    drilldown: [prometheus-agent]
+    ready: false
+    requires: [P3]
+
+  - id: trace.edge_failure_ratio
+    name: 服務間呼叫失敗比例
+    layer: Trace
+    source: prometheus
+    query: |
+      sum by (client, server) (rate(traces_service_graph_request_failed_total[1h]))
+      /
+      sum by (client, server) (rate(traces_service_graph_request_total[1h]))
+    unit: ratio
+    eval: {type: threshold, op: ">", warn: 0.01, crit: 0.05}
+    drilldown: [prometheus-agent, log-agent]
+    ready: false
+    requires: [P3]
+    note: 可以看出是 backend→mysql、backend→redis 還是 backend→kafka 這段在出錯
+
+  # ---------------------------------------------------------------------------
+  # 業務
+  # ---------------------------------------------------------------------------
+  - id: biz.oversell
+    name: 超賣檢查
+    layer: 業務
+    source: mysql
+    query: |
+      SELECT g.id, g.name, g.stock AS initial_stock, COUNT(o.id) AS valid_orders
+      FROM seckill_goods g
+      JOIN seckill_orders o ON o.goods_id = g.id AND o.status <> 3
+      GROUP BY g.id, g.name, g.stock
+      HAVING COUNT(o.id) > g.stock
+    unit: count
+    eval: {type: any, level: crit}
+    drilldown: [mysql-agent, log-agent]
+    ready: true
+    requires: [P1]
+    note: >-
+      假設 seckill_goods.stock 是初始庫存（目前購買流程只扣 Redis，不扣 DB）。
+      若後台會手動調整 stock，需改用另外記錄的初始量
+
+  - id: biz.orders_24h
+    name: 訂單數（24h）
+    layer: 業務
+    source: mysql
+    query: |
+      SELECT COUNT(*) AS orders
+      FROM seckill_orders
+      WHERE create_time >= NOW() - INTERVAL 1 DAY
+    unit: count
+    eval: {type: trend, compare: 1d, warn_pct: 50, crit_pct: 90}
+    drilldown: [mysql-agent, log-agent]
+    ready: true
+    requires: [P1]
+
+  - id: biz.active_sale_no_orders
+    name: 進行中的活動卻沒有訂單
+    layer: 業務
+    source: mysql
+    query: |
+      SELECT g.id, g.name
+      FROM seckill_goods g
+      WHERE NOW() BETWEEN g.start_time AND g.end_time
+        AND g.start_time < NOW() - INTERVAL 15 MINUTE
+        AND NOT EXISTS (
+          SELECT 1 FROM seckill_orders o
+          WHERE o.goods_id = g.id AND o.create_time >= NOW() - INTERVAL 15 MINUTE)
+    unit: count
+    eval: {type: any, level: warn}
+    drilldown: [log-agent, prometheus-agent, mysql-agent]
+    ready: true
+    requires: [P1]
+    note: 開賣 15 分鐘以上卻沒有新訂單，可能是下單鏈路斷掉（Kafka consumer 停擺最常見）
+
+  - id: biz.duplicate_orders
+    name: 同一使用者重複下單同一商品
+    layer: 業務
+    source: mysql
+    query: |
+      SELECT user_id, goods_id, COUNT(*) AS cnt
+      FROM seckill_orders
+      WHERE status <> 3
+      GROUP BY user_id, goods_id
+      HAVING COUNT(*) > 1
+    unit: count
+    eval: {type: any, level: warn}
+    drilldown: [mysql-agent, log-agent]
+    ready: true
+    requires: [P1]
+    note: 僅在「一人限購一件」的業務規則下成立，請先確認
+
+  # ---------------------------------------------------------------------------
+  # 資源（容器層級）
+  # ---------------------------------------------------------------------------
+  - id: res.container_memory
+    name: 容器記憶體使用率
+    layer: 資源
+    source: prometheus
+    query: |
+      max by (name) (container_memory_working_set_bytes{name=~"flashsale-.*"}
+                     / (container_spec_memory_limit_bytes{name=~"flashsale-.*"} > 0))
+    unit: ratio
+    eval: {type: threshold, op: ">", warn: 0.80, crit: 0.95}
+    drilldown: [prometheus-agent]
+    ready: false
+    requires: [P5]
+    note: compose 目前沒有設定記憶體上限，需一併補上 limit 這項才有意義
+
+  - id: res.container_cpu
+    name: 容器 CPU 使用量
+    layer: 資源
+    source: prometheus
+    query: 'sum by (name) (rate(container_cpu_usage_seconds_total{name=~"flashsale-.*"}[1h]))'
+    unit: count
+    eval: {type: trend, compare: 7d, warn_pct: 100, crit_pct: 300}
+    drilldown: [prometheus-agent]
+    ready: false
+    requires: [P5]
+
+  - id: res.disk_usage
+    name: 主機磁碟使用率
+    layer: 資源
+    source: prometheus
+    query: |
+      1 - node_filesystem_avail_bytes{fstype!~"tmpfs|overlay"}
+          / node_filesystem_size_bytes{fstype!~"tmpfs|overlay"}
+    unit: ratio
+    eval: {type: threshold, op: ">", warn: 0.80, crit: 0.90}
+    drilldown: []
+    ready: false
+    requires: [P5]
+    note: Prometheus / Loki / MySQL 的 volume 都在本機，磁碟滿會一次拖垮三個
+
+  # ---------------------------------------------------------------------------
+  # 監控自身
+  # ---------------------------------------------------------------------------
+  - id: obs.backend_log_silence
+    name: 後端日誌中斷
+    layer: 監控自身
+    source: loki
+    query: 'sum(count_over_time({service="backend"}[15m]))'
+    unit: count
+    eval: {type: threshold, op: "<", warn: 1, crit: 1}
+    drilldown: [prometheus-agent]
+    ready: true
+    note: 沒有日誌不代表沒問題；可能是 promtail 或 Loki 掛了，其他日誌類巡檢會全部失真
+
+  - id: obs.tempo_metrics_arriving
+    name: Tempo 衍生指標是否寫入
+    layer: 監控自身
+    source: prometheus
+    query: 'count(traces_spanmetrics_calls_total) or vector(0)'
+    unit: count
+    eval: {type: threshold, op: "<", warn: 1, crit: 1}
+    drilldown: []
+    ready: true
+    note: 目前預期會是紅燈（remote_write 未開），完成 P3 後轉綠，可當作修復驗證
+
+# =============================================================================
+# 前置條件
+# =============================================================================
+prerequisites:
+  P1:
+    title: DBHub 改唯讀 + 非 root 帳號
+    why: 巡檢不可有任何寫入；SQL 類項目本身不受影響
+    how: >-
+      dbhub 改用已註解的那行（--read-only + flashsale 帳號），
+      並 GRANT PROCESS ON *.* TO 'flashsale'@'%' 讓它能讀 innodb_trx / processlist
+  P2:
+    title: Spring Boot 開啟延遲直方圖
+    why: 目前沒有任何延遲分佈指標，P95/P99 查不到
+    how: application.yml 加 management.metrics.distribution.percentiles-histogram.http.server.requests=true
+  P3:
+    title: Prometheus 接收 Tempo remote_write
+    why: span-metrics / service-graphs 已在 tempo.yml 設定，但 Prometheus 沒開接收端
+    how: prometheus command 加 --web.enable-remote-write-receiver
+  P4:
+    title: 補 kafka-exporter
+    why: 目前完全沒有 Kafka 指標（lag、DLQ）
+    how: 加 danielqsj/kafka-exporter 服務（--kafka.server=kafka:9092），並在 prometheus.yml 加 scrape job
+  P5:
+    title: 補 cAdvisor + node-exporter
+    why: 目前沒有容器與主機層級的資源指標
+    how: 加 cadvisor 與 node-exporter 服務及對應 scrape job；compose 各服務補上 mem_limit
